@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::fs;
 use std::sync::Arc;
 use rand::Rng;
+use rusqlite::{params, Connection, OptionalExtension};
 
 #[derive(Deserialize, Debug)]
 struct MediaEntry {
@@ -65,6 +66,8 @@ async fn main() {
 }
 
 async fn handler(State(state): State<Arc<AppState>>, Query(params): Query<VideoQuery>) -> Result<Html<String>, StatusCode> {
+    let media_root = &state.config.get_string("media_root").unwrap();
+
     // Set variable only if video_id is present
     let video_id = params
     .video_id
@@ -72,36 +75,92 @@ async fn handler(State(state): State<Arc<AppState>>, Query(params): Query<VideoQ
 
     let template = state.env.get_template("home").unwrap();
 
-    let (video_path, suggestions) = pick_movie_and_thumbnail(&state.config, video_id);
+    let (video_path, mut suggestions) = pick_movie_and_thumbnail(&state.config, video_id);
+
+    for s in &mut suggestions {
+        s.path = s.path.replace(media_root, "");
+    }
 
     let rendered = template
-        .render(context! {video_path => video_path, suggestions => suggestions})
+        .render(context! {video_path => video_path.replace(media_root, ""), suggestions => suggestions})
         .unwrap();
 
     Ok(Html(rendered))
 }
 
 fn pick_movie_and_thumbnail(config: &Config, video_id: i32) -> (String, Vec<VideoSuggestion>) {
-    let json = fs::read_to_string("media.json").expect("Failed to read file");
-    let mut entries: Vec<MediaEntry> = serde_json::from_str(&json).expect("Invalid JSON");
-    let media_root = config.get_string("media_root").unwrap();
+    // open DB (config key "media_db" or fallback to ./media.db)
+    let db_path = config.get_string("media_db").unwrap_or_else(|_| "media.db".to_string());
+    let conn = Connection::open(db_path).expect("failed to open media db");
 
-    let n_video_suggestions = config.get_int("n_video_suggestions").unwrap();
+    // collect distinct types
+    let mut stmt = conn.prepare("SELECT DISTINCT type FROM media").expect("prepare");
+    let types: Vec<i32> = stmt
+        .query_map([], |r| r.get(0))
+        .expect("query_map")
+        .map(|r| r.expect("row"))
+        .collect();
 
-    let mut rng = rand::rng();
+    let n_total = config.get_int("n_video_suggestions").unwrap() as usize;
+    let n_types = types.len().max(1);
+    let base = n_total / n_types;
+    let mut remainder = n_total % n_types;
 
-    let mut video_idx: i32 = video_id;
-    if video_idx < 0 || video_idx > entries.len() as _ {
-        video_idx = rng.random_range(0..entries.len()) as i32;
-    }
-
-    let video_path = entries.remove(video_idx as usize).movie.replace(&media_root, "");
     let mut suggestions: Vec<VideoSuggestion> = Vec::new();
 
-    for _ in 0 .. n_video_suggestions {
-        let id = rng.random_range(0..entries.len()) as _;
-        let suggestion = VideoSuggestion { path : entries.remove(id).thumbnail.replace(&media_root, ""), video_id: id };
-        suggestions.push(suggestion);
+    // for each type select base (+1 if remainder) random rows
+    for t in types {
+        let mut limit = base;
+        if remainder > 0 {
+            limit += 1;
+            remainder -= 1;
+        }
+        if limit == 0 {
+            continue;
+        }
+
+        let mut s = conn
+            .prepare("SELECT id, thumbnail FROM media WHERE type = ?1 ORDER BY RANDOM() LIMIT ?2")
+            .expect("prepare select");
+        let rows = s
+            .query_map(params![t, limit as i64], |r| {
+                Ok(VideoSuggestion {
+                    path: r.get(1)?,
+                    video_id: r.get::<_, i64>(0)? as usize,
+                })
+            })
+            .expect("query_map");
+
+        for r in rows { 
+            suggestions.push(r.expect("row"));
+        }
     }
+
+    // choose main video: use provided id if valid, otherwise random row
+    let video_path = if video_id >= 0 {
+        conn.query_row(
+            "SELECT path FROM media WHERE id = ?1",
+            params![video_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query_row optional")
+        .unwrap_or_else(|| {
+            conn.query_row(
+                "SELECT path FROM media ORDER BY RANDOM() LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("random fallback")
+        })
+    } else {
+        conn.query_row(
+            "SELECT path FROM media ORDER BY RANDOM() LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("random select")
+    };
+
     (video_path, suggestions)
 }
